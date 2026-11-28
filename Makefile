@@ -1,16 +1,16 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -pthread
+CC      = gcc
+CFLAGS  = -Wall -Wextra -O2 -pthread
 
-all: server worker client
+all: server
 
-server: src/server.c
-	$(CC) $(CFLAGS) src/server.c -o server
+server: src/server.c src/scheduler.c src/scheduler.h
+	$(CC) $(CFLAGS) -o server src/server.c src/scheduler.c
 
-worker: src/worker.c
-	$(CC) $(CFLAGS) src/worker.c -o worker
-
-client: src/client.c
-	$(CC) $(CFLAGS) src/client.c -o client
+# When your team adds src/worker.c and src/client.c, add them to `all:`
+# worker: src/worker.c
+# 	$(CC) $(CFLAGS) -o worker src/worker.c
+# client: src/client.c
+# 	$(CC) $(CFLAGS) -o client src/client.c
 
 clean:
 	rm -f server worker client

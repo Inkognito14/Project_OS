@@ -1,4 +1,4 @@
-#include <studio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -30,14 +30,22 @@ struct job {
     int status;		// status integer that waitpid() gave us
     char *out;		// buffer holding the captured ouptut
     size_t out_len;	// How many bytes of the buffer are filled in
-}
+};
 
 struct job jobs[MAX_K];	// slots for the jobs
 int K = 1; 		// how many jobs may run at once, default 1
 int sock;
 int sig_pipe[2];
 
+volatile sig_atomic_t got_term = 0;
 // --------------------- Helper Functions ----------------------------
+
+// Current time in ms
+long long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 
 // Signal Handler
 void set_handler(int sig, void (*handler)(int)) {
@@ -62,11 +70,63 @@ int write_all(int fd, const char *buf, size_t len) {
     return 0;
 }
 
+void on_signal(int sig) {
+    int saved = errno;	// saving because write() can change errno
+    
+    if (sig == SIGTERM) got_term = 1;
+    write(sig_pipe[1], "x", 1);	// Writing to sig_pipe to wake up
+    errno = saved;
+}
+
 // Sends a message to the server stating how many jobs the worker can run at once
 void send_hello(void) {
     char buf[64];
     snprintf(buf, sizeof buf, "HELLO %d\n", K);
     write_all(sock, buf, strlen(buf));
+}
+
+// Kill the job and everything it started
+void kill_job(struct job *j, int why){
+    // Specifying the reason it was killed 
+    if (j->why == KILL_NONE)
+    	j->why = why;
+    kill(-j->pid, SIGKILL);	// Kill the whole process group
+}
+
+// Cancel the job with a specified ID
+void cancel_job(const char *id){
+    for (int i = 0; i < K; i++){
+    	if (jobs[i].active && strcmp(jobs[i].id, id) == 0){
+    	    kill_job(&jobs[i], KILL_CANCEL);
+    	}
+    }
+}
+
+// Handle a command from the server
+void handle_line(char *line){
+    char id[32];
+    int timeout, off = 0;
+    
+    if (sscanf(line, "RUN %31s %d %n", id, &timeout, &off) == 2)
+        // Run job here: run_job(id, line + off, timeout);
+    else if (sscanf(line, "CANCEL %31s", id) == 1)
+        cancel_job(id);
+}
+
+// Read what is currently in a job's pipe, keeping only the first OUT_LIMIT bytes, but keep reading after that just throwing the rest away in order to free up the pipe
+void read_output(struct job *j) {
+    char buf[4096];
+    ssize_t n;
+    while((n = read(j->out_fd, buf, sizeof buf)) > 0){
+    	size_t room = OUT_LIMIT - j->out_len;	// How much room left in the buffer
+    	size_t take = n;	// How many bytes we want to take
+    	if(take > room)	// Take only as much as you can fit
+    	    take = room;
+    	if(j->out != NULL && take > 0){
+    	    memcpy(j->out + j->out_len, buf, take);	// Apends what's in the buffer to the end of j->out
+    	    j->out_len += take;
+    	}
+    }
 }
 
 int main(int argc, char *argv[]){
@@ -98,7 +158,7 @@ int main(int argc, char *argv[]){
     sock = client_connect(argv[1], atoi(argv[2]));
     
     // Changing the property of a socket so that the worker can exit if the server can not be reached within a second and write() does not wait forever
-    struct timeval tv = {1, 0}
+    struct timeval tv = {1, 0};
     setsockpot(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     
     // The conncetion confirmation
@@ -114,8 +174,8 @@ int main(int argc, char *argv[]){
     	memset(pfds, 0, sizeof pfds);	// sets every byte of the array to 0, so revents starts clean
     	
     	// first entry of pfds, connection to the server
-    	pfds[0].fd = sock
-    	pfds[0].events = POLLIN	// POLLIN wakes when there is something to read
+    	pfds[0].fd = sock;
+    	pfds[0].events = POLLIN; // POLLIN wakes when there is something to read
     	slot_of[0] = -1;
     	// second entry for the signal pipe
     	pfds[1].fd = sig_pipe[0];
@@ -151,6 +211,31 @@ int main(int argc, char *argv[]){
         
         // poll() returns when an fd is ready, a signal comes, or time is up
         poll(pfds, np, wait_ms);
+        // ----------------------------------------------------------------------------------->
+    
+    	// Reacting to whatever woke us up
+    	// if the signal poked the self-pipe then empty it, otherwise poll() would wake up forever
+    	if (pfds[1].revents & POLLIN){
+    	    char tmp[64];
+    	    while (read(sig_pipe[0], tmp, sizeof tmp) > 0){}
+    	}
+    	// looping through job pipes to clean them up
+    	for (int k=2; k < np; k++){
+    	    if(pfds[k].revents & (POLLIN | POLLHUP)){
+    	    	struct job *j = &jobs[slot_of[k]];
+    	    	if (j->active && j->out_fd >= 0)
+            	    read_output(j);	// This will close the pipe at end-of-file
+    	    }
+    	}
+    
+   	 // The server said something
+	if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)){
+	    char line[8192];
+	    if (read_line(sock, line, sizeof line) == 0){	// 0 = the server hung up
+ 	   	 // Shut everything down ---------------------------------------------------
+	    }
+	    handle_line(line);
+    	}
     }
     
     return 0;
